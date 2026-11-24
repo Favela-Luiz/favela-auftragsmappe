@@ -11,6 +11,34 @@
   <!-- Google Identity Services für Google Calendar OAuth -->
   <script src="https://accounts.google.com/gsi/client" async defer></script>
 
+  <!-- Firebase Cloud Firestore SDK (Cloud Sync) -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-app.js";
+    import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.0.0/firebase-firestore.js";
+
+    const firebaseConfig = {
+      apiKey: "AIzaSyDEeXf5X0KaO6vZx8FGMBm6ueLsdw0e1vo",
+      authDomain: "favela-auftragsmappe.firebaseapp.com",
+      projectId: "favela-auftragsmappe",
+      storageBucket: "favela-auftragsmappe.firebasestorage.app",
+      messagingSenderId: "843624217082",
+      appId: "1:843624217082:web:1f6ee5d72a147809f0cc43",
+      measurementId: "G-81R8K96KTN"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getFirestore(app);
+    window.cloudFirestore = {
+      db,
+      doc,
+      setDoc,
+      onSnapshot,
+      ordersDoc: doc(db, "werkstatt", "hauptdaten"),
+      tasksDoc: doc(db, "werkstatt", "aufgaben")
+    };
+    window.dispatchEvent(new Event("firebase-ready"));
+  </script>
+
   <style>
     :root {
       --bg-base: #0a0c10;
@@ -289,7 +317,7 @@
     </nav>
 
     <div class="sidebar-footer">
-      <div id="sidebar-sync-info">Speicher: IndexedDB + LocalStorage</div>
+      <div id="sidebar-sync-info">Cloud: Verbinde Firestore...</div>
       <div id="sidebar-gcal-info" style="margin-top:4px;">Kalender: Nicht verbunden</div>
     </div>
   </aside>
@@ -605,6 +633,8 @@ const StorageService = {
   SETTINGS_KEY: 'fi_settings_v1',
   TIMER_KEY: 'fi_active_timer_v1',
   db: null,
+  cloudConnected: false,
+  suppressNextCloudSnapshot: { orders: false, tasks: false },
 
   defaultSettings() {
     return {
@@ -665,21 +695,24 @@ const StorageService = {
   },
 
   async put(storeName, item) {
-    return new Promise((resolve, reject) => {
+    await new Promise((resolve, reject) => {
       const tx = this.db.transaction(storeName, 'readwrite');
       const req = tx.objectStore(storeName).put(item);
       req.onsuccess = () => resolve(item);
       req.onerror = () => reject(req.error);
     });
+    await this.syncStoreToCloud(storeName);
+    return item;
   },
 
   async remove(storeName, id) {
-    return new Promise((resolve, reject) => {
+    await new Promise((resolve, reject) => {
       const tx = this.db.transaction(storeName, 'readwrite');
       const req = tx.objectStore(storeName).delete(id);
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error);
     });
+    await this.syncStoreToCloud(storeName);
   },
 
   async clearStore(storeName) {
@@ -689,6 +722,98 @@ const StorageService = {
       req.onsuccess = () => resolve();
       req.onerror = () => reject(req.error);
     });
+  },
+
+  async syncStoreToCloud(storeName) {
+    const cf = window.cloudFirestore;
+    if (!cf) return;
+    try {
+      const all = await this.getAll(storeName);
+      if (storeName === 'orders') {
+        this.suppressNextCloudSnapshot.orders = true;
+        await cf.setDoc(cf.ordersDoc, {
+          items: all,
+          updatedAt: new Date().toISOString()
+        });
+      } else if (storeName === 'tasks') {
+        this.suppressNextCloudSnapshot.tasks = true;
+        await cf.setDoc(cf.tasksDoc, {
+          items: all,
+          updatedAt: new Date().toISOString()
+        });
+      }
+      this.cloudConnected = true;
+      App.updateCloudSidebarStatus('verbunden');
+    } catch (err) {
+      console.warn('Firestore Sync Fehler:', err);
+      App.updateCloudSidebarStatus('fehler', err.message);
+    }
+  },
+
+  startCloudListeners(onCloudUpdate) {
+    const attach = () => {
+      const cf = window.cloudFirestore;
+      if (!cf) return;
+
+      cf.onSnapshot(cf.ordersDoc, async (snap) => {
+        this.cloudConnected = true;
+        App.updateCloudSidebarStatus('verbunden');
+        if (this.suppressNextCloudSnapshot.orders) {
+          this.suppressNextCloudSnapshot.orders = false;
+          return;
+        }
+        if (snap.exists() && Array.isArray(snap.data()?.items)) {
+          const cloudItems = snap.data().items;
+          const localItems = await this.getAll('orders');
+          if (JSON.stringify(cloudItems) !== JSON.stringify(localItems)) {
+            await this.clearStore('orders');
+            for (const item of cloudItems) {
+              await new Promise((resolve, reject) => {
+                const tx = this.db.transaction('orders', 'readwrite');
+                const req = tx.objectStore('orders').put(item);
+                req.onsuccess = () => resolve();
+                req.onerror = () => reject(req.error);
+              });
+            }
+            if (onCloudUpdate) await onCloudUpdate();
+          }
+        } else {
+          const localItems = await this.getAll('orders');
+          if (localItems.length > 0) {
+            await this.syncStoreToCloud('orders');
+          }
+        }
+      }, (err) => {
+        console.warn('Firestore Orders Snapshot Fehler:', err);
+        App.updateCloudSidebarStatus('fehler', err.message);
+      });
+
+      cf.onSnapshot(cf.tasksDoc, async (snap) => {
+        if (this.suppressNextCloudSnapshot.tasks) {
+          this.suppressNextCloudSnapshot.tasks = false;
+          return;
+        }
+        if (snap.exists() && Array.isArray(snap.data()?.items)) {
+          const cloudTasks = snap.data().items;
+          const localTasks = await this.getAll('tasks');
+          if (JSON.stringify(cloudTasks) !== JSON.stringify(localTasks)) {
+            await this.clearStore('tasks');
+            for (const t of cloudTasks) {
+              await new Promise((resolve, reject) => {
+                const tx = this.db.transaction('tasks', 'readwrite');
+                const req = tx.objectStore('tasks').put(t);
+                req.onsuccess = () => resolve();
+                req.onerror = () => reject(req.error);
+              });
+            }
+            if (onCloudUpdate) await onCloudUpdate();
+          }
+        }
+      });
+    };
+
+    if (window.cloudFirestore) attach();
+    else window.addEventListener('firebase-ready', attach, { once: true });
   },
 
   async exportJSON(includeSecrets = false) {
@@ -713,9 +838,23 @@ const StorageService = {
     if (!Array.isArray(data.orders)) throw new Error('Ungültiges Backup-Format (orders fehlt).');
     await this.clearStore('orders');
     await this.clearStore('tasks');
-    for (const o of data.orders) await this.put('orders', o);
+    for (const o of data.orders) {
+      await new Promise((resolve, reject) => {
+        const tx = this.db.transaction('orders', 'readwrite');
+        const req = tx.objectStore('orders').put(o);
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    }
     if (Array.isArray(data.tasks)) {
-      for (const t of data.tasks) await this.put('tasks', t);
+      for (const t of data.tasks) {
+        await new Promise((resolve, reject) => {
+          const tx = this.db.transaction('tasks', 'readwrite');
+          const req = tx.objectStore('tasks').put(t);
+          req.onsuccess = () => resolve();
+          req.onerror = () => reject(req.error);
+        });
+      }
     }
     if (data.settings) {
       const cur = this.getSettings();
@@ -725,6 +864,8 @@ const StorageService = {
       }
       this.saveSettings(merged);
     }
+    await this.syncStoreToCloud('orders');
+    await this.syncStoreToCloud('tasks');
   }
 };
 
@@ -1707,11 +1848,27 @@ const App = {
     this.applySettingsToUI();
     this.restoreActiveTimer();
     this.navigate('dashboard');
+    StorageService.startCloudListeners(async () => {
+      await this.reloadData();
+      this.renderCurrentView();
+    });
   },
 
   async reloadData() {
     this.orders = (await StorageService.getAll('orders')).sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
     this.tasks = await StorageService.getAll('tasks');
+  },
+
+  updateCloudSidebarStatus(state, errMsg = '') {
+    const el = document.getElementById('sidebar-sync-info');
+    if (!el) return;
+    if (state === 'verbunden') {
+      el.innerHTML = '<span style="color:var(--success);">☁️ Firestore: Live-Sync aktiv</span>';
+    } else if (state === 'fehler') {
+      el.innerHTML = `<span style="color:var(--danger);" title="${escapeAttr(errMsg)}">⚠️ Firestore: Offline / Regel prüfen</span>`;
+    } else {
+      el.textContent = 'Cloud: Verbinde Firestore...';
+    }
   },
 
   applySettingsToUI() {
@@ -1737,6 +1894,7 @@ const App = {
       imgEl.src = 'logo.png';
     }
     this.updateCalendarSidebarStatus();
+    this.updateCloudSidebarStatus(StorageService.cloudConnected ? 'verbunden' : 'verbinde');
   },
 
   updateCalendarSidebarStatus() {
